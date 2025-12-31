@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import queue
 import time
 import argparse
 import json
@@ -42,6 +43,20 @@ class LSPClient:
         self._next_id = 1
         self._lock = threading.Lock()
 
+        # response dispatch
+        self._pending: Dict[int, "queue.Queue[dict]"] = {}
+        self._pending_lock = threading.Lock()
+
+        # progress tracking
+        self._progress_lock = threading.Lock()
+        self._index_active = 0
+        self._index_seen = False
+        self._progress_tokens: Dict[Any, str] = {}  # token -> title/message
+        self._progress_cv = threading.Condition(self._progress_lock)
+
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader.start()
+
     def _send(self, msg: dict):
         data = json.dumps(msg, separators=(",", ":"),
                           ensure_ascii=False).encode("utf-8")
@@ -77,23 +92,132 @@ class LSPClient:
         body = self._read_exact(length)
         return json.loads(body.decode("utf-8"))
 
+    def _handle_progress(self, token, value: dict):
+        # value: { "kind": "begin"|"report"|"end", ... }
+        kind = value.get("kind")
+        title = value.get("title") or value.get(
+            "message") or self._progress_tokens.get(token, "")
+        if kind == "begin":
+            # Remember title for later
+            if title:
+                self._progress_tokens[token] = title
+
+            # Heuristic: count tasks that look like indexing
+            t = (title or "").lower()
+            if "index" in t or "background" in t:
+                self._index_seen = True
+                self._index_active += 1
+                self._progress_cv.notify_all()
+
+        elif kind == "end":
+            t = (self._progress_tokens.get(token, "") or "").lower()
+            if "index" in t or "background" in t:
+                if self._index_active > 0:
+                    self._index_active -= 1
+                self._progress_cv.notify_all()
+
+            # token no longer needed
+            self._progress_tokens.pop(token, None)
+
+        # "report" is ignored for waiting; could be used for UI
+
+    def _handle_notification_or_server_request(self, msg: dict):
+        method = msg.get("method")
+        if not method:
+            return
+
+        # Server requests (have id) must be responded to.
+        # Most important one: window/workDoneProgress/create
+        if "id" in msg:
+            mid = msg["id"]
+            params = msg.get("params") or {}
+
+            if method == "window/workDoneProgress/create":
+                token = params.get("token")
+                # We don't need to do anything besides accept.
+                # But store token for future correlation if desired.
+                if token is not None:
+                    with self._progress_lock:
+                        # placeholder
+                        self._progress_tokens.setdefault(token, "")
+                self._send({"jsonrpc": "2.0", "id": mid, "result": None})
+                return
+
+            # Default: acknowledge other server->client requests
+            self._send({"jsonrpc": "2.0", "id": mid, "result": None})
+            return
+
+        # Notifications (no id)
+        if method == "$/progress":
+            params = msg.get("params") or {}
+            token = params.get("token")
+            value = params.get("value") or {}
+            with self._progress_lock:
+                self._handle_progress(token, value)
+            return
+
+        # ignore other notifications
+
+    def _reader_loop(self):
+        while True:
+            try:
+                msg = self._read_message()
+            except Exception:
+                return
+
+            # Response to a client request
+            if "id" in msg and "method" not in msg:
+                rid = msg["id"]
+                with self._pending_lock:
+                    q = self._pending.get(rid)
+                if q is not None:
+                    q.put(msg)
+                continue
+
+            # Notification or server request
+            try:
+                self._handle_notification_or_server_request(msg)
+            except Exception:
+                # don't kill reader thread on handler issues
+                continue
+
     def request(self, method: str, params: dict):
         with self._lock:
             rid = self._next_id
             self._next_id += 1
 
+        q: "queue.Queue[dict]" = queue.Queue(maxsize=1)
+        with self._pending_lock:
+            self._pending[rid] = q
+
         self._send({"jsonrpc": "2.0", "id": rid,
                    "method": method, "params": params})
 
-        while True:
-            msg = self._read_message()
-            if msg.get("id") == rid:
-                if "error" in msg:
-                    raise RuntimeError(msg["error"])
-                return msg.get("result")
+        msg = q.get()  # blocks until response arrives
+        with self._pending_lock:
+            self._pending.pop(rid, None)
+
+        if "error" in msg:
+            raise RuntimeError(msg["error"])
+        return msg.get("result")
 
     def notify(self, method: str, params: dict):
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def wait_for_index(self, timeout_s: float = 10.0):
+        """
+        Wait until clangd reports indexing progress ended (best-effort).
+        If clangd never reports any index progress, this returns at timeout.
+        """
+        deadline = time.time() + timeout_s
+        with self._progress_cv:
+            while True:
+                if self._index_seen and self._index_active == 0:
+                    return True
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._progress_cv.wait(timeout=remaining)
 
     def shutdown(self):
         try:
@@ -185,8 +309,12 @@ def request_definition(client: LSPClient, loc: Loc) -> List[Loc]:
     return []
 
 
-def request_workspace_symbol(client, query, tries=50, sleep_s=0.1):
-    for _ in range(tries):
+def request_workspace_symbol(client, query, timeout_s=3.0, sleep_s=0.05):
+    deadline = time.time() + timeout_s
+    count = 1
+    while time.time() < deadline:
+        print(f"request for {count} times")
+        count += 1
         res = client.request("workspace/symbol", {"query": query}) or []
         if isinstance(res, list) and res:
             return res
@@ -358,6 +486,7 @@ def main(argv=None) -> int:
             client.proc,), daemon=True).start()
 
     try:
+        print("requesting initialize")
         _ = client.request("initialize", {
             "processId": os.getpid(),
             "rootUri": path_to_uri(str(project_root)),
@@ -366,18 +495,22 @@ def main(argv=None) -> int:
                 "name": project_root.name,
             }],
             "capabilities": {
+                "window": {"workDoneProgress": True},
                 "textDocument": {
                     "hover": {"contentFormat": ["markdown", "plaintext"]},
                     "callHierarchy": {}
                 },
-                "workspace": {
-                    "symbol": {}
-                }
+                "workspace": {"symbol": {}}
             }
         })
+        print("notify initialized")
         client.notify("initialized", {})
+        print("open anchor from compdb")
         open_anchor_from_compdb(client, cc_dir, args.language)
+        print("wait for index...")
+        client.wait_for_index(timeout_s=10.0)
 
+        print("run command")
         # --- v1 path: user provided --file (keep your proven behavior) ---
         if args.file:
             file_path = Path(args.file).resolve()
