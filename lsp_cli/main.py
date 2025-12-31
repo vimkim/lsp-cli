@@ -50,6 +50,16 @@ class LSPClient:
         self.proc.stdin.write(header + data)
         self.proc.stdin.flush()
 
+    def _read_exact(self, n: int) -> bytes:
+        assert self.proc.stdout is not None
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.proc.stdout.read(n - len(buf))
+            if not chunk:
+                raise RuntimeError("clangd stdout closed while reading body")
+            buf.extend(chunk)
+        return bytes(buf)
+
     def _read_message(self) -> dict:
         assert self.proc.stdout is not None
         headers = {}
@@ -64,7 +74,7 @@ class LSPClient:
             headers[k.strip().lower()] = v.strip()
 
         length = int(headers["content-length"])
-        body = self.proc.stdout.read(length)
+        body = self._read_exact(length)
         return json.loads(body.decode("utf-8"))
 
     def request(self, method: str, params: dict):
